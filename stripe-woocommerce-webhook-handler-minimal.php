@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Minimal Stripe Webhook Handler for WooCommerce
  * Description: Handles Stripe webhooks for WooCommerce
- * Version: 0.1
+ * Version: 0.2
  * Author: Sergei Palmer
  */
 
@@ -89,17 +89,39 @@ function handle_checkout_session_completed($session) {
     if ($full_session->customer_details) {
         $order->set_billing_first_name($full_session->customer_details->name);
         $order->set_billing_email($full_session->customer_details->email);
+
+        if (isset($full_session->customer_details->address)) {
+            $billing_address = $full_session->customer_details->address;
+            $order->set_billing_address_1($billing_address->line1);
+            $order->set_billing_address_2($billing_address->line2);
+            $order->set_billing_city($billing_address->city);
+            $order->set_billing_state($billing_address->state);
+            $order->set_billing_postcode($billing_address->postal_code);
+            $order->set_billing_country($billing_address->country);
+        }
     }
 
     // Set shipping details
     if ($full_session->shipping) {
+        // If shipping details are provided, use them
+        $shipping_details = $full_session->shipping->address;
         $order->set_shipping_first_name($full_session->shipping->name);
-        $order->set_shipping_address_1($full_session->shipping->address->line1);
-        $order->set_shipping_address_2($full_session->shipping->address->line2);
-        $order->set_shipping_city($full_session->shipping->address->city);
-        $order->set_shipping_state($full_session->shipping->address->state);
-        $order->set_shipping_postcode($full_session->shipping->address->postal_code);
-        $order->set_shipping_country($full_session->shipping->address->country);
+    } elseif (isset($full_session->customer_details->address)) {
+        // If no shipping details but billing address exists, use billing as shipping
+        $shipping_details = $full_session->customer_details->address;
+        $order->set_shipping_first_name($full_session->customer_details->name);
+    } else {
+        // No shipping or billing address available
+        $shipping_details = null;
+    }
+
+    if ($shipping_details) {
+        $order->set_shipping_address_1($shipping_details->line1);
+        $order->set_shipping_address_2($shipping_details->line2);
+        $order->set_shipping_city($shipping_details->city);
+        $order->set_shipping_state($shipping_details->state);
+        $order->set_shipping_postcode($shipping_details->postal_code);
+        $order->set_shipping_country($shipping_details->country);
     }
 
     // Add order notes
