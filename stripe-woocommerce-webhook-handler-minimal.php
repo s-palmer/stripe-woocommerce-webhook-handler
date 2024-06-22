@@ -11,6 +11,9 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Include Stripe PHP library
+require_once(WP_PLUGIN_DIR . '/stripe-php/init.php');
+
 // Register the webhook endpoint
 add_action('rest_api_init', function () {
     register_rest_route('custom-stripe-webhook/v1', '/handle', array(
@@ -28,6 +31,10 @@ function handle_stripe_webhook(WP_REST_Request $request) {
         return new WP_Error('json_error', 'Invalid JSON payload', array('status' => 400));
     }
 
+    if (is_stripe_test_mode()) {
+        error_log('Stripe webhook received in test mode: ' . $event['type']);
+    }
+
     switch ($event['type']) {
         case 'checkout.session.completed':
             handle_checkout_session_completed($event['data']['object']);
@@ -43,39 +50,71 @@ function handle_stripe_webhook(WP_REST_Request $request) {
 }
 
 function handle_checkout_session_completed($session) {
+    // Get the Stripe secret key from WordPress options
+    $stripe_secret_key = get_option('stripe_secret_key');
+
+    // Initialize Stripe with the secret key
+    $stripe = new \Stripe\StripeClient($stripe_secret_key);
+
+    // Get full session details from Stripe
+    $full_session = $stripe->checkout->sessions->retrieve($session['id'], ['expand' => ['line_items', 'customer']]);
+
+    // Create a new WooCommerce order
     $order = wc_create_order();
 
-    // Get line items from the Stripe Checkout Session
-    $line_items = \Stripe\Checkout\Session::retrieve([
-        'id' => $session['id'],
-        'expand' => ['line_items'],
-    ])->line_items;
-
-    foreach ($line_items->data as $item) {
+    // Add line items to the order
+    foreach ($full_session->line_items->data as $item) {
         $product_id = get_product_id_from_stripe($item->price->product);
         if ($product_id) {
             $product = wc_get_product($product_id);
             $order->add_product($product, $item->quantity);
-
-            // If it's a subscription product, add the corresponding number of single products
-            $subscription_quantity = get_subscription_quantity($product_id);
-            if ($subscription_quantity > 0) {
-                $single_product_id = get_single_product_id();
-                $single_product = wc_get_product($single_product_id);
-                $order->add_product($single_product, $subscription_quantity * $item->quantity);
-            }
+        } else {
+            // If product not found, add a line item with available info
+            $order->add_item(array(
+                'name' => $item->description,
+                'qty' => $item->quantity,
+                'total' => $item->amount_total / 100, // Convert cents to dollars/pounds
+            ));
         }
     }
 
-    $order->set_total($session['amount_total'] / 100);
-    $order->set_currency(strtoupper($session['currency']));
+    // Set order details
+    $order->set_total($full_session->amount_total / 100);
+    $order->set_currency(strtoupper($full_session->currency));
     $order->set_payment_method('stripe');
     $order->set_payment_method_title('Stripe');
-    $order->set_customer_id($session['customer']);
+    $order->set_customer_id($full_session->customer->id);
 
+    // Set billing details
+    if ($full_session->customer_details) {
+        $order->set_billing_first_name($full_session->customer_details->name);
+        $order->set_billing_email($full_session->customer_details->email);
+    }
+
+    // Set shipping details
+    if ($full_session->shipping) {
+        $order->set_shipping_first_name($full_session->shipping->name);
+        $order->set_shipping_address_1($full_session->shipping->address->line1);
+        $order->set_shipping_address_2($full_session->shipping->address->line2);
+        $order->set_shipping_city($full_session->shipping->address->city);
+        $order->set_shipping_state($full_session->shipping->address->state);
+        $order->set_shipping_postcode($full_session->shipping->address->postal_code);
+        $order->set_shipping_country($full_session->shipping->address->country);
+    }
+
+    // Add order notes
+    $order->add_order_note('Order created from Stripe Checkout Session ' . $full_session->id);
+
+    // Set order status to processing
+    $order->update_status('processing', 'Order paid via Stripe');
+
+    // Save the order
     $order->save();
 
+    // Trigger the WooCommerce order created action
     do_action('woocommerce_new_order', $order->get_id());
+
+    error_log('WooCommerce order created from Stripe session: ' . $full_session->id);
 }
 
 function handle_invoice_paid($invoice) {
@@ -83,32 +122,44 @@ function handle_invoice_paid($invoice) {
         return;
     }
 
+    // Create a new WooCommerce order
     $order = wc_create_order();
 
+    // Add line items to the order
     foreach ($invoice['lines']['data'] as $line) {
         $product_id = get_product_id_from_stripe($line['price']['product']);
         if ($product_id) {
             $product = wc_get_product($product_id);
             $order->add_product($product, $line['quantity']);
-
-            // Add the corresponding number of single products
-            $subscription_quantity = get_subscription_quantity($product_id);
-            if ($subscription_quantity > 0) {
-                $single_product_id = get_single_product_id();
-                $single_product = wc_get_product($single_product_id);
-                $order->add_product($single_product, $subscription_quantity * $line['quantity']);
-            }
+        } else {
+            // If product not found, add a line item with available info
+            $order->add_item(array(
+                'name' => $line['description'],
+                'qty' => $line['quantity'],
+                'total' => $line['amount'] / 100, // Convert cents to dollars/pounds
+            ));
         }
     }
 
+    // Set order details
     $order->set_total($invoice['amount_paid'] / 100);
     $order->set_currency(strtoupper($invoice['currency']));
     $order->set_payment_method('stripe');
     $order->set_payment_method_title('Stripe Subscription');
 
+    // Add order notes
+    $order->add_order_note('Order created from Stripe invoice ' . $invoice['id']);
+
+    // Set order status to processing
+    $order->update_status('processing', 'Subscription renewed via Stripe');
+
+    // Save the order
     $order->save();
 
+    // Trigger the WooCommerce order created action
     do_action('woocommerce_new_order', $order->get_id());
+
+    error_log('WooCommerce order created from Stripe invoice: ' . $invoice['id']);
 }
 
 function get_product_id_from_stripe($stripe_product_id) {
@@ -121,12 +172,8 @@ function get_product_id_from_stripe($stripe_product_id) {
     return !empty($products) ? $products[0]->get_id() : null;
 }
 
-function get_subscription_quantity($product_id) {
-    return get_post_meta($product_id, '_subscription_quantity', true) ?: 0;
-}
-
-function get_single_product_id() {
-    return get_option('single_product_id');
+function is_stripe_test_mode() {
+    return get_option('stripe_mode', 'test') === 'test';
 }
 
 // Add Stripe Product ID field to WooCommerce products
@@ -140,25 +187,65 @@ function add_stripe_product_id_field() {
             'desc_tip' => true,
         )
     );
-
-    woocommerce_wp_text_input(
-        array(
-            'id' => '_subscription_quantity',
-            'label' => __('Subscription Quantity', 'woocommerce'),
-            'description' => __('Enter the number of single products in this subscription.', 'woocommerce'),
-            'desc_tip' => true,
-            'type' => 'number',
-        )
-    );
 }
 
-// Save the Stripe Product ID and Subscription Quantity
+// Save the Stripe Product ID
 add_action('woocommerce_process_product_meta', 'save_stripe_product_id_field');
 function save_stripe_product_id_field($post_id) {
     $stripe_product_id = isset($_POST['_stripe_product_id']) ? sanitize_text_field($_POST['_stripe_product_id']) : '';
     update_post_meta($post_id, '_stripe_product_id', $stripe_product_id);
+}
 
-    $subscription_quantity = isset($_POST['_subscription_quantity']) ? intval($_POST['_subscription_quantity']) : 0;
-    update_post_meta($post_id, '_subscription_quantity', $subscription_quantity);
+// Add menu item
+add_action('admin_menu', 'stripe_webhook_menu');
+
+function stripe_webhook_menu() {
+    add_options_page('Stripe Webhook Settings', 'Stripe Webhook', 'manage_options', 'stripe-webhook-settings', 'stripe_webhook_settings_page');
+}
+
+// Create the settings page
+function stripe_webhook_settings_page() {
+    ?>
+    <div class="wrap">
+        <h1>Stripe Webhook Settings</h1>
+        <form method="post" action="options.php">
+            <?php
+            settings_fields('stripe_webhook_options');
+            do_settings_sections('stripe-webhook-settings');
+            submit_button();
+            ?>
+        </form>
+    </div>
+    <?php
+}
+
+// Register settings
+add_action('admin_init', 'stripe_webhook_settings_init');
+
+function stripe_webhook_settings_init() {
+    register_setting('stripe_webhook_options', 'stripe_secret_key');
+    register_setting('stripe_webhook_options', 'stripe_mode');
+
+    add_settings_section('stripe_webhook_section', 'Stripe API Settings', 'stripe_webhook_section_callback', 'stripe-webhook-settings');
+
+    add_settings_field('stripe_secret_key', 'Stripe Secret Key', 'stripe_secret_key_callback', 'stripe-webhook-settings', 'stripe_webhook_section');
+    add_settings_field('stripe_mode', 'Stripe Mode', 'stripe_mode_callback', 'stripe-webhook-settings', 'stripe_webhook_section');
+}
+
+function stripe_webhook_section_callback() {
+    echo '<p>Enter your Stripe API settings below:</p>';
+}
+
+function stripe_secret_key_callback() {
+    $secret_key = get_option('stripe_secret_key');
+    echo '<input type="text" id="stripe_secret_key" name="stripe_secret_key" value="' . esc_attr($secret_key) . '" style="width: 300px;" />';
+}
+
+function stripe_mode_callback() {
+    $mode = get_option('stripe_mode', 'test');
+    echo '<select id="stripe_mode" name="stripe_mode">';
+    echo '<option value="test" ' . selected($mode, 'test', false) . '>Test</option>';
+    echo '<option value="live" ' . selected($mode, 'live', false) . '>Live</option>';
+    echo '</select>';
 }
 ?>
