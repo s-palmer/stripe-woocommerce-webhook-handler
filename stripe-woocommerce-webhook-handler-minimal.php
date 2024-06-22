@@ -57,7 +57,6 @@ function handle_checkout_session_completed($session) {
 
     error_log('Full Stripe session data: ' . print_r($full_session, true));
 
-    // Create order
     $order = wc_create_order();
 
     // Add line items to the order
@@ -80,12 +79,14 @@ function handle_checkout_session_completed($session) {
     $order->set_currency(strtoupper($full_session->currency));
     $order->set_payment_method('stripe');
     $order->set_payment_method_title('Stripe');
-    $order->set_customer_id($full_session->customer->id);
 
     // Set billing details
     if (isset($full_session->customer_details)) {
-        $order->set_billing_first_name($full_session->customer_details->name);
         $order->set_billing_email($full_session->customer_details->email);
+        $order->set_billing_phone($full_session->customer_details->phone);
+        $name_parts = explode(' ', $full_session->customer_details->name, 2);
+        $order->set_billing_first_name($name_parts[0]);
+        $order->set_billing_last_name(isset($name_parts[1]) ? $name_parts[1] : '');
 
         if (isset($full_session->customer_details->address)) {
             $billing_address = $full_session->customer_details->address;
@@ -99,25 +100,30 @@ function handle_checkout_session_completed($session) {
     }
 
     // Set shipping details
-    if (isset($full_session->shipping)) {
-        $shipping_details = $full_session->shipping->address;
-        $order->set_shipping_first_name($full_session->shipping->name);
-        $order->set_shipping_address_1($shipping_details->line1);
-        $order->set_shipping_address_2($shipping_details->line2);
-        $order->set_shipping_city($shipping_details->city);
-        $order->set_shipping_state($shipping_details->state);
-        $order->set_shipping_postcode($shipping_details->postal_code);
-        $order->set_shipping_country($shipping_details->country);
+    if (isset($full_session->shipping_details)) {
+        $shipping_details = $full_session->shipping_details;
+        $name_parts = explode(' ', $shipping_details->name, 2);
+        $order->set_shipping_first_name($name_parts[0]);
+        $order->set_shipping_last_name(isset($name_parts[1]) ? $name_parts[1] : '');
+
+        if (isset($shipping_details->address)) {
+            $order->set_shipping_address_1($shipping_details->address->line1);
+            $order->set_shipping_address_2($shipping_details->address->line2);
+            $order->set_shipping_city($shipping_details->address->city);
+            $order->set_shipping_state($shipping_details->address->state);
+            $order->set_shipping_postcode($shipping_details->address->postal_code);
+            $order->set_shipping_country($shipping_details->address->country);
+        }
     } elseif (isset($full_session->customer_details->address)) {
         // If no shipping details but billing address exists, use billing as shipping
-        $billing_address = $full_session->customer_details->address;
-        $order->set_shipping_first_name($full_session->customer_details->name);
-        $order->set_shipping_address_1($billing_address->line1);
-        $order->set_shipping_address_2($billing_address->line2);
-        $order->set_shipping_city($billing_address->city);
-        $order->set_shipping_state($billing_address->state);
-        $order->set_shipping_postcode($billing_address->postal_code);
-        $order->set_shipping_country($billing_address->country);
+        $order->set_shipping_first_name($order->get_billing_first_name());
+        $order->set_shipping_last_name($order->get_billing_last_name());
+        $order->set_shipping_address_1($order->get_billing_address_1());
+        $order->set_shipping_address_2($order->get_billing_address_2());
+        $order->set_shipping_city($order->get_billing_city());
+        $order->set_shipping_state($order->get_billing_state());
+        $order->set_shipping_postcode($order->get_billing_postcode());
+        $order->set_shipping_country($order->get_billing_country());
     }
 
     // Add order notes
@@ -137,25 +143,23 @@ function handle_checkout_session_completed($session) {
 }
 
 function handle_invoice_paid($invoice) {
-    if ($invoice['billing_reason'] != 'subscription_cycle') {
-        return;
-    }
+    error_log('Received invoice.paid event: ' . print_r($invoice, true));
 
     // Create a new WooCommerce order
     $order = wc_create_order();
 
     // Add line items to the order
-    foreach ($invoice['lines']['data'] as $line) {
-        $product_id = get_product_id_from_stripe($line['price']['product']);
+    foreach ($invoice['lines']['data'] as $item) {
+        $product_id = get_product_id_from_stripe($item['price']['product']);
         if ($product_id) {
             $product = wc_get_product($product_id);
-            $order->add_product($product, $line['quantity']);
+            $order->add_product($product, $item['quantity']);
         } else {
             // If product not found, add a line item with available info
             $order->add_item(array(
-                'name' => $line['description'],
-                'qty' => $line['quantity'],
-                'total' => $line['amount'] / 100, // Convert cents to dollars/pounds
+                'name' => $item['description'],
+                'qty' => $item['quantity'],
+                'total' => $item['amount'] / 100, // Convert cents to dollars/pounds
             ));
         }
     }
@@ -164,21 +168,58 @@ function handle_invoice_paid($invoice) {
     $order->set_total($invoice['amount_paid'] / 100);
     $order->set_currency(strtoupper($invoice['currency']));
     $order->set_payment_method('stripe');
-    $order->set_payment_method_title('Stripe Subscription');
+    $order->set_payment_method_title('Stripe');
+    $order->set_customer_id($invoice['customer']);
+
+    // Set billing details
+    if (isset($invoice['customer_name'])) {
+        $name_parts = explode(' ', $invoice['customer_name'], 2);
+        $order->set_billing_first_name($name_parts[0]);
+        $order->set_billing_last_name(isset($name_parts[1]) ? $name_parts[1] : '');
+    }
+    $order->set_billing_email($invoice['customer_email']);
+    if (isset($invoice['customer_address'])) {
+        $order->set_billing_address_1($invoice['customer_address']['line1']);
+        $order->set_billing_address_2($invoice['customer_address']['line2']);
+        $order->set_billing_city($invoice['customer_address']['city']);
+        $order->set_billing_state($invoice['customer_address']['state']);
+        $order->set_billing_postcode($invoice['customer_address']['postal_code']);
+        $order->set_billing_country($invoice['customer_address']['country']);
+    }
+
+    // Set shipping details if available
+    if (isset($invoice['customer_shipping'])) {
+        $shipping = $invoice['customer_shipping'];
+        $name_parts = explode(' ', $shipping['name'], 2);
+        $order->set_shipping_first_name($name_parts[0]);
+        $order->set_shipping_last_name(isset($name_parts[1]) ? $name_parts[1] : '');
+        $order->set_shipping_address_1($shipping['address']['line1']);
+        $order->set_shipping_address_2($shipping['address']['line2']);
+        $order->set_shipping_city($shipping['address']['city']);
+        $order->set_shipping_state($shipping['address']['state']);
+        $order->set_shipping_postcode($shipping['address']['postal_code']);
+        $order->set_shipping_country($shipping['address']['country']);
+    }
 
     // Add order notes
-    $order->add_order_note('Order created from Stripe invoice ' . $invoice['id']);
+    if ($invoice['billing_reason'] === 'subscription_cycle') {
+        $order->add_order_note('Subscription renewal order created from Stripe invoice ' . $invoice['id']);
+    } else {
+        $order->add_order_note('Order created from Stripe invoice ' . $invoice['id']);
+    }
 
     // Set order status to processing
-    $order->update_status('processing', 'Subscription renewed via Stripe');
+    $order->update_status('processing', 'Order paid via Stripe');
 
     // Save the order
     $order->save();
 
-    // Trigger the WooCommerce order created action
-    do_action('woocommerce_new_order', $order->get_id());
+    // Trigger the WooCommerce new order actions
+    // Pass both the order ID and the order object
+    do_action('woocommerce_new_order', $order->get_id(), $order);
 
     error_log('WooCommerce order created from Stripe invoice: ' . $invoice['id']);
+    error_log('WooCommerce order details: ' . print_r($order->get_data(), true));
 }
 
 function get_product_id_from_stripe($stripe_product_id) {
