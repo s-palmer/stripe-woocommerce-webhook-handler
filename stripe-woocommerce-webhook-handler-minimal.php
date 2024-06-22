@@ -50,16 +50,11 @@ function handle_stripe_webhook(WP_REST_Request $request) {
 }
 
 function handle_checkout_session_completed($session) {
-    // Get the Stripe secret key from WordPress options
     $stripe_secret_key = get_option('stripe_secret_key');
-
-    // Initialize Stripe with the secret key
     $stripe = new \Stripe\StripeClient($stripe_secret_key);
 
-    // Get full session details from Stripe
     $full_session = $stripe->checkout->sessions->retrieve($session['id'], ['expand' => ['line_items', 'customer']]);
 
-    // Create a new WooCommerce order
     $order = wc_create_order();
 
     // Add line items to the order
@@ -69,11 +64,10 @@ function handle_checkout_session_completed($session) {
             $product = wc_get_product($product_id);
             $order->add_product($product, $item->quantity);
         } else {
-            // If product not found, add a line item with available info
             $order->add_item(array(
                 'name' => $item->description,
                 'qty' => $item->quantity,
-                'total' => $item->amount_total / 100, // Convert cents to dollars/pounds
+                'total' => $item->amount_total / 100,
             ));
         }
     }
@@ -103,25 +97,24 @@ function handle_checkout_session_completed($session) {
 
     // Set shipping details
     if ($full_session->shipping) {
-        // If shipping details are provided, use them
         $shipping_details = $full_session->shipping->address;
         $order->set_shipping_first_name($full_session->shipping->name);
-    } elseif (isset($full_session->customer_details->address)) {
-        // If no shipping details but billing address exists, use billing as shipping
-        $shipping_details = $full_session->customer_details->address;
-        $order->set_shipping_first_name($full_session->customer_details->name);
-    } else {
-        // No shipping or billing address available
-        $shipping_details = null;
-    }
-
-    if ($shipping_details) {
         $order->set_shipping_address_1($shipping_details->line1);
         $order->set_shipping_address_2($shipping_details->line2);
         $order->set_shipping_city($shipping_details->city);
         $order->set_shipping_state($shipping_details->state);
         $order->set_shipping_postcode($shipping_details->postal_code);
         $order->set_shipping_country($shipping_details->country);
+    } elseif (isset($full_session->customer_details->address)) {
+        // If no shipping details but billing address exists, use billing as shipping
+        $billing_address = $full_session->customer_details->address;
+        $order->set_shipping_first_name($full_session->customer_details->name);
+        $order->set_shipping_address_1($billing_address->line1);
+        $order->set_shipping_address_2($billing_address->line2);
+        $order->set_shipping_city($billing_address->city);
+        $order->set_shipping_state($billing_address->state);
+        $order->set_shipping_postcode($billing_address->postal_code);
+        $order->set_shipping_country($billing_address->country);
     }
 
     // Add order notes
