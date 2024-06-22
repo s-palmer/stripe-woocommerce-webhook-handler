@@ -55,6 +55,9 @@ function handle_checkout_session_completed($session) {
 
     $full_session = $stripe->checkout->sessions->retrieve($session['id'], ['expand' => ['line_items', 'customer']]);
 
+    error_log('Full Stripe session data: ' . print_r($full_session, true));
+
+    // Create order
     $order = wc_create_order();
 
     // Add line items to the order
@@ -80,7 +83,7 @@ function handle_checkout_session_completed($session) {
     $order->set_customer_id($full_session->customer->id);
 
     // Set billing details
-    if ($full_session->customer_details) {
+    if (isset($full_session->customer_details)) {
         $order->set_billing_first_name($full_session->customer_details->name);
         $order->set_billing_email($full_session->customer_details->email);
 
@@ -96,7 +99,7 @@ function handle_checkout_session_completed($session) {
     }
 
     // Set shipping details
-    if ($full_session->shipping) {
+    if (isset($full_session->shipping)) {
         $shipping_details = $full_session->shipping->address;
         $order->set_shipping_first_name($full_session->shipping->name);
         $order->set_shipping_address_1($shipping_details->line1);
@@ -126,10 +129,11 @@ function handle_checkout_session_completed($session) {
     // Save the order
     $order->save();
 
-    // Trigger the WooCommerce order created action
-    do_action('woocommerce_new_order', $order->get_id());
+    // Trigger the WooCommerce new order actions with correct arguments
+    do_action('woocommerce_new_order', $order->get_id(), $order);
 
     error_log('WooCommerce order created from Stripe session: ' . $full_session->id);
+    error_log('WooCommerce order details: ' . print_r($order->get_data(), true));
 }
 
 function handle_invoice_paid($invoice) {
